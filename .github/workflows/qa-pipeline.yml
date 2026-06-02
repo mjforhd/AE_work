@@ -1,0 +1,259 @@
+# A Chat QA Pipeline — GitHub Actions
+#
+# 파이프라인 3단계 구조 (CICD_DESIGN.md §1 기반):
+#   1) unit-test      : PR 포함 항상 실행. API 호출 없음. 빠른 피드백.
+#   2) integration    : main 병합·nightly만. 실제 LLM API 호출 + Blocking 게이트.
+#   3) benchmark      : integration 통과 후. 모델 비교 리포트 생성.
+#   4) llm-judge      : nightly 스케줄만. 비용 큰 Judge 채점.
+#
+# Quality Gate (PART 1 §7):
+#   - Blocking 테스트 FAIL → job exit ≠ 0 → 배포 단계 자동 차단 (NO-GO)
+#   - Non-Blocking WARNING → 파이프라인 통과 + 아티팩트로 추적 (HOLD)
+
+name: A Chat QA Pipeline
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 1 * * *'   # 매일 01:00 UTC (KST 10:00) — nightly Drift 감지
+  workflow_dispatch:        # 웹 UI / API에서 수동 트리거
+    inputs:
+      run_integration:
+        description: '통합 테스트 실행 여부 (기본: true)'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+      run_benchmark:
+        description: '벤치마크 리포트 실행 여부 (기본: true)'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+
+env:
+  PYTHON_VERSION: '3.11'
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'  # Node.js 20 deprecation 경고 해소
+
+jobs:
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 1. 단위 테스트 — API 호출 없음, PR 포함 항상 실행
+  #    목적: 스키마 검증·어댑터 로직·Validator 단위 로직 회귀 차단
+  # ────────────────────────────────────────────────────────────────────────────
+  unit-test:
+    name: "Unit Test (no API)"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: |
+          python -m pytest -m "not api" \
+            --tb=short \
+            --junitxml=reports/junit-unit.xml \
+            -v
+
+      - name: Upload JUnit report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-unit-${{ github.run_id }}
+          path: reports/junit-unit.xml
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 2. 통합 테스트 — 실제 LLM API 호출, main 병합·nightly만 실행
+  #    목적: 3개 모델 실 동작 검증 + Blocking 게이트 (NO-GO 조건 판정)
+  #    실패 시: Slack 알림 발송 → 배포 파이프라인 자동 차단
+  # ────────────────────────────────────────────────────────────────────────────
+  integration-test:
+    name: "Integration Test (API)"
+    runs-on: ubuntu-latest
+    needs: unit-test
+    if: |
+      github.event_name != 'pull_request' &&
+      (github.event_name != 'workflow_dispatch' || inputs.run_integration == 'true')
+
+    env:
+      OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      GOOGLE_API_KEY:    ${{ secrets.GOOGLE_API_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run integration tests (Blocking 포함)
+        run: |
+          python -m pytest -m "api and not slow" \
+            --tb=short \
+            --junitxml=reports/junit-integration.xml \
+            -v
+
+      - name: Run slow integration tests (nightly only)
+        if: github.event_name == 'schedule'
+        run: |
+          python -m pytest -m "api and slow" \
+            --tb=short \
+            --junitxml=reports/junit-slow.xml \
+            -v
+
+      - name: Upload JUnit reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-integration-${{ github.run_id }}
+          path: reports/junit-*.xml
+
+      # Blocking 게이트 실패 시 Slack 알림 (CICD_DESIGN.md §3)
+      # SLACK_WEBHOOK_URL Secret이 없으면 알림 없이 조용히 스킵
+      - name: Notify Slack — Blocking failure (NO-GO)
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "SLACK_WEBHOOK_URL not set — skipping notification"
+            exit 0
+          fi
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"attachments\": [{
+                \"color\": \"danger\",
+                \"title\": \"🚨 [A Chat QA] 통합 테스트 실패 — 배포 차단 (NO-GO)\",
+                \"fields\": [
+                  {\"title\": \"브랜치\",  \"value\": \"\`${{ github.ref_name }}\`\",          \"short\": true},
+                  {\"title\": \"커밋\",    \"value\": \"\`${{ github.sha }}\`\",               \"short\": true},
+                  {\"title\": \"트리거\",  \"value\": \"\`${{ github.event_name }}\`\",        \"short\": true},
+                  {\"title\": \"파이프라인\", \"value\": \"<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|확인하기>\", \"short\": true}
+                ]
+              }]
+            }"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 3. 모델 비교 벤치마크 리포트 — 통합 테스트 통과 후 실행
+  #    목적: 5개 프롬프트 × 3개 모델 성능·품질 수치 비교 + Drift 감지 (PART 1 §8)
+  # ────────────────────────────────────────────────────────────────────────────
+  benchmark:
+    name: "Model Benchmark Report"
+    runs-on: ubuntu-latest
+    needs: integration-test
+    if: |
+      github.event_name != 'pull_request' &&
+      (github.event_name != 'workflow_dispatch' || inputs.run_benchmark == 'true')
+
+    env:
+      OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      GOOGLE_API_KEY:    ${{ secrets.GOOGLE_API_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate benchmark report
+        run: |
+          python -m reports.reporter \
+            --output reports/benchmark_results.json \
+            --max-tokens 300
+
+      - name: Upload benchmark report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-${{ github.run_id }}
+          path: reports/benchmark_results.json
+          retention-days: 90   # 시계열 Baseline 추적용 장기 보관
+
+      # 벤치마크 리포트상 경고 시 Slack 알림 (HOLD 후보)
+      # SLACK_WEBHOOK_URL Secret이 없으면 알림 없이 조용히 스킵
+      - name: Notify Slack — Benchmark warning (HOLD)
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "SLACK_WEBHOOK_URL not set — skipping notification"
+            exit 0
+          fi
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"attachments\": [{
+                \"color\": \"warning\",
+                \"title\": \"⚠️ [A Chat QA] 벤치마크 리포트 이상 감지 (HOLD 후보)\",
+                \"text\": \"모델 간 품질·성능 지표에 이상이 감지되었습니다. 리포트를 확인하세요.\",
+                \"fields\": [
+                  {\"title\": \"브랜치\",     \"value\": \"\`${{ github.ref_name }}\`\", \"short\": true},
+                  {\"title\": \"파이프라인\", \"value\": \"<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|확인하기>\", \"short\": true}
+                ]
+              }]
+            }"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 4. LLM Judge 자동 채점 — nightly 스케줄만 실행 (API 비용 절감)
+  #    목적: Cross-evaluation 기반 4기준 자동 채점 + Human Review 플래그 기록
+  # ────────────────────────────────────────────────────────────────────────────
+  llm-judge:
+    name: "LLM Judge Evaluation"
+    runs-on: ubuntu-latest
+    needs: integration-test
+    if: github.event_name == 'schedule'
+
+    env:
+      OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      GOOGLE_API_KEY:    ${{ secrets.GOOGLE_API_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run LLM Judge (3 prompts × 3회 일관성 검증)
+        run: |
+          python -m judge.llm_judge \
+            --prompts 3 \
+            --consistency-runs 3 \
+            2>&1 | tee reports/llm-judge.log
+
+      - name: Upload Judge results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: llm-judge-${{ github.run_id }}
+          path: reports/llm-judge.log
+          retention-days: 30
